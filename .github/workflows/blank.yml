@@ -1,27 +1,19 @@
-
-  name: Domain Confusion & Takeover Hunter
+name: Web Cache Poisoning Hunter
 
 on:
-  schedule:
-    # Runs weekly at 00:00 UTC to catch expired domains
-    - cron: '0 0 * * 0'
   workflow_dispatch:
     inputs:
       domains:
-        description: 'Target Domains separated by / (e.g., f.com/j.com)'
+        description: 'Domains separated by / (e.g., f.com/j.com/x.com)'
         required: true
         type: string
-      custom_saas_keywords:
-        description: 'SaaS keywords to grep for (e.g., okta, azure, salesforce, auth0, shopify) separated by spaces'
-        required: false
-        type: string
-      custom_extra_domains:
-        description: 'Any extra specific domains to check for confusion (separated by /)'
+      file_path:
+        description: 'Path to a domains .txt file in repo (one per line)'
         required: false
         type: string
 
 jobs:
-  confusion-hunter:
+  cache-poison-hunter:
     runs-on: ubuntu-latest
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -31,12 +23,15 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Tools
+      - name: Install Dependencies
         run: |
           sudo apt-get update > /dev/null 2>&1 && sudo apt-get install -y jq > /dev/null 2>&1
+
+      - name: Install Tools
+        run: |
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest > /dev/null 2>&1
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest > /dev/null 2>&1
-          go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest > /dev/null 2>&1
+          go install github.com/projectdiscovery/katana/cmd/katana@latest > /dev/null 2>&1
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest > /dev/null 2>&1
           echo "$HOME/go/bin" >> $GITHUB_PATH
 
@@ -45,135 +40,122 @@ jobs:
 
       - name: Prepare Targets
         run: |
-          touch main_targets.txt
-          echo "${{ github.event.inputs.domains }}" | tr '/' '\n' | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' >> main_targets.txt
-          
-          if [ -n "${{ github.event.inputs.custom_extra_domains }}" ]; then
-            echo "${{ github.event.inputs.custom_extra_domains }}" | tr '/' '\n' | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' >> main_targets.txt
+          touch targets.txt
+          if [ -n "${{ github.event.inputs.domains }}" ]; then
+            echo "${{ github.event.inputs.domains }}" | tr '/' '\n' | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' >> targets.txt
           fi
-          
-          sort -u main_targets.txt -o main_targets.txt
+          if [ -n "${{ github.event.inputs.file_path }}" ] && [ -f "${{ github.event.inputs.file_path }}" ]; then
+            cat "${{ github.event.inputs.file_path }}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' >> targets.txt
+          fi
+          sort -u targets.txt -o targets.txt
           
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=🧩 Domain Confusion Hunter Starting for $(wc -l < main_targets.txt | xargs) targets..." || true
+            --data-urlencode "text=🧪 Cache Poisoning Pipeline Starting for $(wc -l < targets.txt | xargs) targets..." || true
 
-      - name: Step 1 - Subdomain Enumeration
+      - name: Step 1 - Subfinder & Tech Detect
         run: |
+          set +e
           while IFS= read -r target; do
-            subfinder -d "$target" -silent -o "${target}_subs.txt" || true
-          done < main_targets.txt
-          cat *_subs.txt > all_subs.txt 2>/dev/null || true
-          touch all_subs.txt
-          sort -u all_subs.txt -o all_subs.txt
+            if [ -z "$target" ]; then continue; fi
+            safe=$(echo "$target" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c 1-50)
+            
+            subfinder -d "$target" -silent -o "${safe}_subs.txt" || true
+            touch "${safe}_subs.txt"
+            
+            cat "${safe}_subs.txt" | httpx -tech-detect -json -silent -o "${safe}_httpx.json" || true
+            jq -r '.url' "${safe}_httpx.json" 2>/dev/null | sort -u > "${safe}_live.txt" || true
+            touch "${safe}_live.txt"
+            
+          done < targets.txt
+          
+          cat *_live.txt > all_live.txt 2>/dev/null || true
+          cat *_httpx.json > all_httpx.json 2>/dev/null || true
+          touch all_live.txt all_httpx.json
 
-      - name: Step 2 - Primary Domain Confusion Detection
+      - name: Step 2 - Katana Deep Crawl
         run: |
-          > dead_roots.txt
-          > alive_subs.txt
+          if [ ! -s "all_live.txt" ]; then exit 0; fi
           
-          # 1. Check which subdomains are actually alive
-          cat all_subs.txt | httpx -silent -o alive_subs.txt || true
-          touch alive_subs.txt
+          cat all_live.txt | katana -d 3 -jc -aff -silent -o katana_raw.txt || true
+          cat katana_raw.txt | httpx -fc 404 -silent | sort -u > all_endpoints.txt || true
+          touch all_endpoints.txt
           
-          # 2. Extract ROOT domains from the subdomains (e.g., api.target.com -> target.com)
-          cat all_subs.txt | awk -F. '{print $(NF-1)"."$NF}' | sort -u > extracted_roots.txt
-          
-          # 3. Check if ROOT domains resolve. If they don't (NXDOMAIN), it's a CRITICAL Confusion vector
-          echo ">>> Checking for unregistered root domains (Primary Domain Confusion risk)..."
-          cat extracted_roots.txt | dnsx -json -a -silent | jq -r 'select(.a == null) | .host' >> dead_roots.txt 2>/dev/null || true
-          
-          if [ -s "dead_roots.txt" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-              -F chat_id="${TELEGRAM_CHAT_ID}" \
-              -F document="@dead_roots.txt" \
-              -F caption="🚨 CRITICAL: Unregistered Root Domains Found! (Primary Domain Confusion Risk)" || true
-          else
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=✅ All root domains are registered. No primary confusion risk." || true
-          fi
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+            -F chat_id="${TELEGRAM_CHAT_ID}" \
+            -F document="@all_endpoints.txt" \
+            -F caption="🕷️ Crawled Live Endpoints to Test for Cache Poisoning" || true
 
-      - name: Step 3 - CNAME & Replication Confusion Extraction
+      - name: Step 3 - Isolate Cached Infrastructure
         run: |
-          # Get CNAME records for all subdomains
-          echo ">>> Extracting CNAME records..."
-          cat all_subs.txt | dnsx -cname -silent -json | jq -r '.host + " -> " + (.cname | join(", "))' > cnames_raw.txt 2>/dev/null || true
+          if [ ! -s "all_httpx.json" ]; then exit 0; fi
           
-          # Filter CNAMEs pointing to external cloud providers (Potential Takeover/Replication Confusion)
-          grep -iE "aws|cloudfront|heroku|shopify|azure|s3|fastly|cloudflare|github|atlassian" cnames_raw.txt > suspicious_cnames.txt 2>/dev/null || true
-          touch suspicious_cnames.txt
+          > cached_targets.txt
+          jq -r 'select(.tech | join(" ") | test("cloudflare|fastly|varnish|akamai|nginx|squid|cdn"; "i")) | .url' all_httpx.json >> cached_targets.txt 2>/dev/null || true
           
-          if [ -s "suspicious_cnames.txt" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-              -F chat_id="${TELEGRAM_CHAT_ID}" \
-              -F document="@suspicious_cnames.txt" \
-              -F caption="☁️ Suspicious Cloud CNAMEs Found (Takeover/Replication Risk)" || true
-          fi
-
-      - name: Step 4 - Custom SaaS Keyword Filtering
-        env:
-          KEYWORDS: ${{ github.event.inputs.custom_saas_keywords }}
-        run: |
-          if [ -z "$KEYWORDS" ] || [ ! -s "alive_subs.txt" ]; then
-            echo "No custom keywords provided or no alive subs. Skipping."
-            exit 0
-          fi
-          
-          > custom_saas_hits.txt
-          echo ">>> Searching for custom SaaS keywords: $KEYWORDS"
-          
-          # Probe alive subs and extract the full response body/header to grep against
-          cat alive_subs.txt | httpx -silent -status-code -tech-detect -json -o httpx_full.json || true
-          
-          # Loop through user keywords and find matches
-          for keyword in $KEYWORDS; do
-            grep -i "$keyword" httpx_full.json | jq -r '.url + " [" + (.status_code|tostring) + "] - Tech: " + (.tech | join(", "))' >> custom_saas_hits.txt 2>/dev/null || true
+          for url in $(cat cached_targets.txt); do
+            domain=$(echo "$url" | awk -F/ '{print $3}')
+            grep "$domain" all_endpoints.txt >> cached_endpoints.txt 2>/dev/null || true
           done
           
-          if [ -s "custom_saas_hits.txt" ]; then
-            sort -u custom_saas_hits.txt -o custom_saas_hits.txt
+          if [ ! -s "cached_endpoints.txt" ]; then
+            cp all_endpoints.txt cached_endpoints.txt
+          fi
+          sort -u cached_endpoints.txt -o cached_endpoints.txt
+          touch cached_endpoints.txt
+          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+            -F chat_id="${TELEGRAM_CHAT_ID}" \
+            -F document="@cached_endpoints.txt" \
+            -F caption="☁️ Endpoints Sitting Behind Caching Infrastructure" || true
+
+      - name: Step 4 - Pro Header Reflection Fuzzing
+        run: |
+          if [ ! -s "cached_endpoints.txt" ]; then exit 0; fi
+          
+          > reflection_hits.txt
+          head -n 50 cached_endpoints.txt > fuzz_sample.txt
+          
+          cat fuzz_sample.txt | xargs -P 10 -I {} curl -s --max-time 5 "{}" \
+            -H "X-Forwarded-Host: evil-cacher-poison.com" \
+            -H "X-Host: evil-cacher-poison.com" \
+            -H "X-Forwarded-Scheme: https" \
+            -H "X-Cache-Key: evil-cacher-poison.com" 2>/dev/null | grep -i "evil-cacher-poison.com" >> reflection_hits.txt || true
+          
+          if [ -s "reflection_hits.txt" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
               -F chat_id="${TELEGRAM_CHAT_ID}" \
-              -F document="@custom_saas_hits.txt" \
-              -F caption="🎯 Custom SaaS Keyword Matches Found!" || true
+              -F document="@reflection_hits.txt" \
+              -F caption="🚨 CRITICAL: Unkeyed Header Reflection Detected!" || true
           else
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=✅ No matches found for keywords: $KEYWORDS" || true
+              --data-urlencode "text=✅ No immediate unkeyed header reflection found." || true
           fi
 
-      - name: Step 5 - Nuclei Takeover Verification
+      - name: Step 5 - Nuclei Cache Poisoning Engine
         run: |
-          # We only feed the suspicious CNAMEs into Nuclei to verify if they are actually vulnerable
-          if [ ! -s "suspicious_cnames.txt" ]; then
-            echo "No suspicious CNAMEs to test."
-            exit 0
-          fi
+          if [ ! -s "cached_endpoints.txt" ]; then exit 0; fi
           
-          # Extract just the URLs from the suspicious CNAMEs file
-          awk '{print $1}' suspicious_cnames.txt > takeover_targets.txt
+          nuclei -l cached_endpoints.txt -tags cache-poison,cache-deception -silent -o nuclei_cache_results.txt || true
+          touch nuclei_cache_results.txt
           
-          echo ">>> Running Nuclei Takeover/Confusion templates..."
-          nuclei -l takeover_targets.txt -tags takeover,confusion -silent -o nuclei_takeover_results.txt || true
-          touch nuclei_takeover_results.txt
-          
-          if [ -s "nuclei_takeover_results.txt" ]; then
+          if [ -s "nuclei_cache_results.txt" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
               -F chat_id="${TELEGRAM_CHAT_ID}" \
-              -F document="@nuclei_takeover_results.txt" \
-              -F caption="🔥 CONFIRMED TAKEOVER / CONFUSION VULNERABILITIES!" || true
+              -F document="@nuclei_cache_results.txt" \
+              -F caption="🔥 CONFIRMED CACHE POISONING VULNERABILITIES!" || true
           else
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=✅ Nuclei: Takeovers not possible on discovered CNAMEs (backends are active)." || true
+              --data-urlencode "text=✅ Nuclei: No automated cache poisoning vectors confirmed." || true
           fi
 
       - name: Upload All Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: confusion-hunter-run-${{ github.run_id }}
+          name: cache-poisoning-run-${{ github.run_id }}
           path: |
             *.txt
             *.json
@@ -184,4 +166,4 @@ jobs:
         run: |
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=🛑 Domain Confusion & Takeover Pipeline Completely Finished." || true
+            --data-urlencode "text=🛑 Web Cache Poisoning Pipeline Completely Finished." || true
